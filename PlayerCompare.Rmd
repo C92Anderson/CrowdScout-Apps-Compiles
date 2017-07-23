@@ -1,0 +1,394 @@
+---
+title: "Player Compare App"
+runtime: shiny
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2);library(dplyr); library(DataCombine)
+library(glmnet); library(nhlscrapr); library(caret); library(RMySQL); library(readr); library(reshape2); library(rvest)
+library(twitteR);library(httr); library(data.table); library("reshape2");
+library(shiny)
+library(ggplot2)
+library(xts)
+library(RMySQL)
+library(DBI)
+theme_set(theme_bw())
+
+options(shiny.deprecation.messages=FALSE)
+
+conn <- dbConnect(
+    drv = RMySQL::MySQL(),
+    dbname = "nhl_all",
+    host = "mysql.crowdscoutsports.com",
+    username = "ca_elo_games",
+    password = "cprice31!")
+
+
+  #on.exit(dbDisconnect(conn)) 
+
+
+## Get prior player level predictions
+crowdscout_data_predictions <- dbGetQuery(conn, "SELECT * FROM `nhl_all`.crowdscout_data_predictions")
+skater.season.stats.long <- dbGetQuery(conn, "SELECT * FROM `nhl_all`.skater_season_stats_long")
+player_elo <- dbGetQuery(conn, "SELECT * FROM `nhl_all`.player_elo")
+#load("~/Documents/CWA/Hockey Data/crowdscout_data_predictions.RData")
+#load("~/Documents/CWA/Hockey Data/player_elo.RData")
+#load("~/Documents/CWA/Hockey Data/skater.season.stats.long.RData")
+
+dbDisconnect(conn)
+
+########################
+### Find percentiles
+########################
+G60_EV_P33 <- summarise(group_by(crowdscout_data_predictions[crowdscout_data_predictions$TOI_EV > 6000, ],Pos), G60_EV_P33 = quantile(G60_EV, probs = 0.33))
+G60_EV_P66 <- summarise(group_by(crowdscout_data_predictions[crowdscout_data_predictions$TOI_EV > 6000, ],Pos), G60_EV_P66 = quantile(G60_EV, probs = 0.66))
+
+G60_PP_P33 <- summarise(group_by(crowdscout_data_predictions[crowdscout_data_predictions$TOI_PP > 600, ],Pos), G60_PP_P33 = quantile(G60_PP, probs = 0.33))
+G60_PP_P66 <- summarise(group_by(crowdscout_data_predictions[crowdscout_data_predictions$TOI_PP > 600, ],Pos), G60_PP_P66 = quantile(G60_PP, probs = 0.66))
+
+P60_EV_P33 <- summarise(group_by(crowdscout_data_predictions[crowdscout_data_predictions$TOI_EV > 6000, ],Pos), P60_EV_P33 = quantile(P60_EV, probs = 0.33))
+P60_EV_P66 <- summarise(group_by(crowdscout_data_predictions[crowdscout_data_predictions$TOI_EV > 6000, ],Pos), P60_EV_P66 = quantile(P60_EV, probs = 0.66))
+
+P60_PP_P33 <- summarise(group_by(crowdscout_data_predictions[crowdscout_data_predictions$TOI_PP > 600, ],Pos), P60_PP_P33 = quantile(P60_PP, probs = 0.33))
+P60_PP_P66 <- summarise(group_by(crowdscout_data_predictions[crowdscout_data_predictions$TOI_PP > 600, ],Pos), P60_PP_P66 = quantile(P60_PP, probs = 0.66))
+
+prod.perc = merge(G60_EV_P33,G60_EV_P66, by="Pos") %>%
+            merge(G60_PP_P33) %>% merge(G60_PP_P66) %>% merge(P60_EV_P33) %>% merge(P60_EV_P66) %>% merge(P60_PP_P33) %>% merge(P60_PP_P66)
+          
+  
+G60_EV_Pctl <-quantile(crowdscout_data_predictions$G60_EV, probs = c(0.10,0.33, 0.66,0.90))
+G60_PP_Pctl <-quantile(crowdscout_data_predictions$G60_PP, probs = c(0.10,0.33, 0.66,0.90))
+G60_SH_Pctl <-quantile(crowdscout_data_predictions$G60_SH, probs = c(0.10,0.33, 0.66,0.90))
+
+## Ev
+xGF60_EV_Pctl <-quantile(crowdscout_data_predictions[crowdscout_data_predictions$TOI_EV > 6000, "xGF60_EV"], probs = c(0.10,0.33,0.5,0.66,0.90))
+xGA60_EV_Pctl <-quantile(crowdscout_data_predictions[crowdscout_data_predictions$TOI_EV > 6000, "xGA60_EV"], probs = c(0.10,0.33,0.5,0.66,0.90))
+
+## PP
+xGF60_PP_Pctl <-quantile(crowdscout_data_predictions$xGF60_PP, probs = c(0.10,0.33, 0.66,0.90))
+xGA60_PP_Pctl <-quantile(crowdscout_data_predictions$xGA60_PP, probs = c(0.10,0.33, 0.66,0.90))
+
+## SH
+xGF60_SH_Pctl <-quantile(crowdscout_data_predictions$xGF60_SH, probs = c(0.10,0.33, 0.66,0.90))
+xGA60_SH_Pctl <-quantile(crowdscout_data_predictions$xGA60_SH, probs = c(0.10,0.33, 0.66,0.90))
+
+##############################################################################
+##############################################################################
+### Player Compare Function
+##############################################################################
+##############################################################################
+
+player.compare.function <- function(p1, p2, seasons = c("20142015","20152016","20162017"), states = c("EV", "PP","SH")) {
+    
+    p1_elo <- player_elo %>% filter(toupper(Player) == p1) %>% tail(1) %>% select(Score)
+    p2_elo <- player_elo %>% filter(toupper(Player) == p2) %>% tail(1) %>% select(Score)
+ 
+    p1_pelo <- crowdscout_data_predictions %>% filter(toupper(Player) == p1) %>% tail(1) %>% select(Predicted.CS)
+    p2_pelo <- crowdscout_data_predictions %>% filter(toupper(Player) == p2) %>% tail(1) %>% select(Predicted.CS)
+    
+    proto <- ggplot() +
+      ## Player 1
+      geom_text(aes(x=1,y=0.1, label=paste0(p1," - CROWDSCOUT SCORE")), hjust=0.5, vjust=-1, color="grey30", size=3.5) +
+      ## Actual
+      geom_text(aes(x=0.5,y=0.05, label="ACTUAL"), hjust=0.5, vjust=-1, color="grey30", size=3.5) +
+      geom_point(aes(x=0.5,y=0, color=p1_elo$Score),size=10) +
+      geom_text(aes(x=0.5,y=0, label=round(p1_elo$Score)),hjust=0.5, vjust=0.5, color="grey80") +
+      ## Predicted
+      geom_point(aes(x=1.5,y=0, color=p1_elo$Score),size=10) +
+      geom_text(aes(x=1.5,y=0, label=round(p1_elo$Score)),hjust=0.5, vjust=0.5, color="grey80") +
+      facet_wrap(~Player)
+      scale_color_gradient2(low="brown4",high="green4")
+      
+    ###########
+    ### Percentiles
+    percentiles <- skater.season.stats.long %>%
+      select(Player,Pos, season, player.team.state, G60, P160, P60) %>%
+      group_by(Pos, player.team.state) %>%
+      mutate(G60 = percent_rank(G60),
+             A160 = percent_rank(P160),
+             A260 = percent_rank(P60)) %>%
+      filter(Player %in% c(p1,p2) & season %in% seasons & player.team.state %in% states) %>%
+      ungroup() %>%
+      select(Player, season, player.team.state, G60, A160, A260) %>%
+      melt(id.vars = c("Player","season","player.team.state"), value.name="Pctl") 
+  
+      ##############################################################################
+    ### Production
+    prod.player <- skater.season.stats.long %>%
+        filter(Player %in% c(p1,p2) & season %in% seasons & player.team.state %in% states) %>%
+        mutate(PlayerNo = ifelse(Player == p1, 1, 2)) %>%
+        arrange(PlayerNo, season, player.team.state) %>%
+        mutate(Key = paste0(season," - ",player.team.state)) %>%
+        select(PlayerNo, Player, season,Key, Pos, Share.of.Ice, ixG60, G60, A160, A260, player.team.state, TOI) %>%
+        melt(id.vars = c("PlayerNo","Player","season", "Key","Pos","Share.of.Ice","player.team.state", "TOI")) 
+      
+    ## Set Levels
+    prod.player$variable <- factor(prod.player$variable, levels = c("A260","A160","G60","ixG60"))
+    prod.player$Player <- factor(prod.player$Player, levels = c(p1, p2))
+    
+    xG.player <- prod.player %>% 
+            filter(variable == "ixG60") %>% 
+            select(PlayerNo,Player,player.team.state,season,value) %>% 
+            dplyr::rename(xG = value)
+    
+    G.player <- prod.player %>% 
+            filter(variable == "G60") %>% 
+            select(PlayerNo,Player,player.team.state,value, season,TOI) %>% 
+            dplyr::rename(G = value)  %>% 
+            left_join(xG.player, by=c("PlayerNo","Player","player.team.state","season")) %>%
+            mutate(shooting = (G - xG) * (TOI / 3600))
+
+    
+    production.data <- prod.player %>%
+        filter(variable != "ixG60") %>%
+        left_join(percentiles, by=c("Player","season","player.team.state","variable"))
+ 
+    ## Order
+    production.data$Player = factor(production.data$Player, levels=c(p1, p2))
+    production.data$variable <- factor(production.data$variable, levels = c("A260","A160","G60","ixG60"))
+ 
+    production.plot <- production.data %>%
+        ggplot() +
+    geom_bar(aes(x=reorder(interaction(season,player.team.state, lex.order = TRUE,sep = " - "),PlayerNo), y=value, group=variable, color=variable, fill=Pctl), 
+             stat = "identity", size=1.5) +
+    scale_fill_gradient2(low="coral4",mid="grey50",high="darkorchid4", midpoint = .50) +
+   ## xG 
+    #geom_bar(data=xG.player,aes(x=reorder(interaction(season,player.team.state, lex.order = TRUE),PlayerNo), y=xG), color = "grey30",
+    #         stat = "identity", alpha = 0, size = 1.25) +
+    ## Goals Over Expected Label
+    geom_label(data=G.player,aes(x=reorder(interaction(season,player.team.state, lex.order = TRUE,sep = " - "),PlayerNo), y=max(prod.player$value), 
+                                 label=paste0(round(shooting,1))), color="grey30", size=3) +
+    #  scale_fill_manual(values = alpha(c("red", "purple","blue"), c(0.33,0.66,1))) +
+    geom_label(aes(x=0.5, y=max(prod.player$value) + 0.75, label="'Surplus' Goals\nActual Goals - xGoals"), fill="white", hjust=0, color="grey30", size=3) +
+    scale_alpha_continuous(range=c(0.5,1)) +
+    facet_wrap(~Player) +
+    labs(title=paste0(p1," CROWDSCOUT SCORE: ",round(p1_elo,1), " | PREDICTED: ",round(p1_pelo,1),"\n"
+                      ,p2," CROWDSCOUT SCORE: ",round(p2_elo,1)," | PREDICTED: ",round(p2_pelo,1),"\nPRODUCTION"), x="", y="Production per 60 mins", fill="Percentile Rank\n(By Position)",
+         color="Production") +
+    theme(legend.position = "bottom") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+    
+    ##############################################################################
+    ### Plot xG Player - Relatives
+    ##############################################################################
+    player.plot <- skater.season.stats.long %>%
+      filter(Player %in% c(p1,p2) & season %in% seasons) %>%
+      mutate(PlayerNo = ifelse(Player == p1, 1, 2)) %>%
+      arrange(PlayerNo, season) %>%
+      mutate(Key = paste0(Player,"-",season)) %>%
+      select(PlayerNo, Player, season, player.team.state, TOI, Share.of.Ice, xGF60, xGF60_teamWO, 
+             xGA60, xGA60_teamWO) %>%
+      melt(id.vars = c("PlayerNo","Player", "season", "player.team.state","TOI", "Share.of.Ice"))
+    
+    ## Order
+    player.plot$Player = factor(player.plot$Player, levels=c(p1, p2))
+    
+    ## Shape Data For Points & Lines
+    player.points <- player.plot %>%
+      mutate(xG.dimension = ifelse(substr(variable,1,5) == "xGF60","xGF",
+                                   ifelse(substr(variable,1,5) == "xGA60","xGA", "")),
+             xG.measure = ifelse(substr(variable,6,7) == "_t","TeamWO","Player")) %>%
+      dcast(player.team.state + PlayerNo + Player + season + TOI + Share.of.Ice + xG.measure ~ xG.dimension, value.var="value")
+    
+    ## Shape Data For Points & Lines
+    player.lines <- player.plot %>%
+      mutate(xG.dimension = ifelse(substr(variable,1,5) == "xGF60","xGF",
+                                   ifelse(substr(variable,1,5) == "xGA60","xGA", "")),
+             xG.measure = ifelse(substr(variable,6,7) == "_t","TeamWO","Player")) %>%
+      dcast(player.team.state + PlayerNo + Player + season + TOI + Share.of.Ice  ~ xG.measure + xG.dimension, value.var="value")
+    
+    ## Shape Data For Points
+    ev.player.points <- player.points %>% filter(player.team.state == "EV") 
+    pp.player.points <- player.points %>% filter(player.team.state == "PP") 
+    sh.player.points <- player.points %>% filter(player.team.state == "SH") 
+    
+    ev.player.lines <- player.lines %>% filter(player.team.state == "EV") 
+    pp.player.lines <- player.lines %>% filter(player.team.state == "PP") 
+    sh.player.lines <- player.lines %>% filter(player.team.state == "SH") 
+    
+    ## Even Strength Plot
+    ev.results.plot <-  ggplot() +
+      annotate("text",x=xGA60_EV_Pctl[4], y=xGF60_EV_Pctl[4], label="Good", hjust=1, size=3, color="grey30") +
+      annotate("text",x=xGA60_EV_Pctl[1], y=xGF60_EV_Pctl[1],  label="Bad", hjust=0, size=3, color="grey30") +
+      annotate("text",x=xGA60_EV_Pctl[1], y=xGF60_EV_Pctl[4], label="Exciting", hjust=0, size=3, color="grey30") +
+      annotate("text",x=xGA60_EV_Pctl[4], y=xGF60_EV_Pctl[1],  label="Boring", hjust=1, size=3, color="grey30") +
+      ##Diagonal
+      annotate("segment",x=xGA60_EV_Pctl[4],y=xGF60_EV_Pctl[1],xend=xGA60_EV_Pctl[1], yend=xGF60_EV_Pctl[4], color="grey70") +
+      ## Percentiles
+      ## xGA 
+      annotate("segment",x=xGA60_EV_Pctl[3],y=xGF60_EV_Pctl[1],xend=xGA60_EV_Pctl[3], yend=xGF60_EV_Pctl[4], color="grey70") +
+      annotate("text",x=xGA60_EV_Pctl[3],y=xGF60_EV_Pctl[1], label="66%le", color="grey40", hjust=0, size=3) +
+      annotate("segment",x=xGA60_EV_Pctl[2],y=xGF60_EV_Pctl[1],xend=xGA60_EV_Pctl[2], yend=xGF60_EV_Pctl[4], color="grey70") +
+      annotate("text",x=xGA60_EV_Pctl[2],y=xGF60_EV_Pctl[1], label="33%le", color="grey40", hjust=0, size=3) +
+
+      ## xGF 
+      annotate("segment",y=xGF60_EV_Pctl[3],x=xGA60_EV_Pctl[1],yend=xGF60_EV_Pctl[3], xend=xGA60_EV_Pctl[4], color="grey70") +
+      annotate("text",y=xGF60_EV_Pctl[3],x=xGA60_EV_Pctl[1], label="66%le", color="grey40", vjust=0, size=3) +
+      annotate("segment",y=xGF60_EV_Pctl[2],x=xGA60_EV_Pctl[1],yend=xGF60_EV_Pctl[2], xend=xGA60_EV_Pctl[4], color="grey70") +
+      annotate("text",y=xGF60_EV_Pctl[2],x=xGA60_EV_Pctl[1], label="33%le", color="grey40", vjust=0, size=3) +
+      
+      ## Even Strength
+      geom_point(data=ev.player.points, aes(x=xGA, y=xGF,group=xG.measure, shape=xG.measure, size=Share.of.Ice, color=season, alpha=season)) +
+      geom_segment(data=ev.player.lines, aes(x=TeamWO_xGA, y=TeamWO_xGF, xend=Player_xGA, yend=Player_xGF, color=season, alpha=season),
+                   arrow = arrow(length=unit(0.30,"cm"), type = "closed")) +
+      scale_size_continuous(limits = c(0,1)) +
+      scale_alpha_discrete(range=c(0.25,1)) +
+      
+      facet_grid(~Player) +
+      labs(title=paste0("EVEN STRENGTH"), x="Team Expected Goals Against / 60 min", y="Team Expected Goals For / 60 min",
+         color="Season",shape="xG Result",alpha="Season",size="% of Team State\nPlayer On-Ice") +
+       theme(legend.position = "top",
+            axis.ticks=element_blank(),
+            panel.grid.major=element_blank(),
+            panel.grid.minor=element_blank()) #+ guides( size = FALSE, shape = FALSE,alpha = FALSE ,color = FALSE )    
+    
+    ## Powerplay Plot
+    pp.results.plot <-  ggplot() +
+      annotate("text",x=xGA60_PP_Pctl[4], y=xGF60_PP_Pctl[4], label="Good", hjust=1, size=3, color="grey30") +
+      annotate("text",x=xGA60_PP_Pctl[1], y=xGF60_PP_Pctl[1],  label="Bad", hjust=0, size=3, color="grey30") +
+      annotate("text",x=xGA60_PP_Pctl[1], y=xGF60_PP_Pctl[4], label="Exciting", hjust=0, size=3, color="grey30") +
+      annotate("text",x=xGA60_PP_Pctl[4], y=xGF60_PP_Pctl[1],  label="Boring", hjust=1, size=3, color="grey30") +
+      ##Diagonal
+      annotate("segment",x=xGA60_PP_Pctl[4],y=xGF60_PP_Pctl[1],xend=xGA60_PP_Pctl[1], yend=xGF60_PP_Pctl[4], color="grey70") +
+      ## Percentiles
+      ## xGA 
+      annotate("segment",x=xGA60_PP_Pctl[3],y=xGF60_PP_Pctl[1],xend=xGA60_PP_Pctl[3], yend=xGF60_PP_Pctl[4], color="grey70") +
+      annotate("text",x=xGA60_PP_Pctl[3],y=xGF60_PP_Pctl[1], label="66%le", color="grey40", hjust=0, size=3) +
+      annotate("segment",x=xGA60_PP_Pctl[2],y=xGF60_PP_Pctl[1],xend=xGA60_PP_Pctl[2], yend=xGF60_PP_Pctl[4], color="grey70") +
+      annotate("text",x=xGA60_PP_Pctl[2],y=xGF60_PP_Pctl[1], label="33%le", color="grey40", hjust=0, size=3) +
+      
+      ## xGF 
+      annotate("segment",y=xGF60_PP_Pctl[3],x=xGA60_PP_Pctl[1],yend=xGF60_PP_Pctl[3], xend=xGA60_PP_Pctl[4], color="grey70") +
+      annotate("text",y=xGF60_PP_Pctl[3],x=xGA60_PP_Pctl[1], label="66%le", color="grey40", vjust=0, size=3) +
+      annotate("segment",y=xGF60_PP_Pctl[2],x=xGA60_PP_Pctl[1],yend=xGF60_PP_Pctl[2], xend=xGA60_PP_Pctl[4], color="grey70") +
+      annotate("text",y=xGF60_PP_Pctl[2],x=xGA60_PP_Pctl[1], label="33%le", color="grey40", vjust=0, size=3) +
+      
+      ## Powerplay
+      geom_point(data=pp.player.points, aes(x=xGA, y=xGF,group=xG.measure, shape=xG.measure, size=Share.of.Ice, color=season, alpha=season)) +
+      geom_segment(data=pp.player.lines, aes(x=TeamWO_xGA, y=TeamWO_xGF, xend=Player_xGA, yend=Player_xGF, color=season, alpha=season),
+                   arrow = arrow(length=unit(0.30,"cm"), type = "closed")) +
+      scale_size_continuous(limits = c(0,1)) +
+      scale_alpha_discrete(range=c(0.25,1)) +
+      facet_grid(~Player) +
+      labs(title=paste0("POWERPLAY"), x="", y=" ",
+           color="Season",shape="xG Result",alpha="Season",size="% of Team State\nPlayer On-Ice") +
+      theme(legend.position = "top") +
+      theme(axis.ticks=element_blank(),
+            panel.grid.major=element_blank(),
+            panel.grid.minor=element_blank()) #+ guides( size = FALSE, shape = FALSE,alpha = FALSE ,color = FALSE )    
+
+    
+    ## Shorthanded Plot
+    sh.results.plot <-  ggplot() +
+      annotate("text",x=xGA60_SH_Pctl[4], y=xGF60_SH_Pctl[4], label="Good", hjust=1, size=3, color="grey30") +
+      annotate("text",x=xGA60_SH_Pctl[1], y=xGF60_SH_Pctl[1],  label="Bad", hjust=0, size=3, color="grey30") +
+      annotate("text",x=xGA60_SH_Pctl[1], y=xGF60_SH_Pctl[4], label="Exciting", hjust=0, size=3, color="grey30") +
+      annotate("text",x=xGA60_SH_Pctl[4], y=xGF60_SH_Pctl[1],  label="Boring", hjust=1, size=3, color="grey30") +
+      ##Diagonal
+      annotate("segment",x=xGA60_SH_Pctl[4],y=xGF60_SH_Pctl[1],xend=xGA60_SH_Pctl[1], yend=xGF60_SH_Pctl[4], color="grey70") +
+      ## Percentiles
+      ## xGA 
+      annotate("segment",x=xGA60_SH_Pctl[3],y=xGF60_SH_Pctl[1],xend=xGA60_SH_Pctl[3], yend=xGF60_SH_Pctl[4], color="grey70") +
+      annotate("text",x=xGA60_SH_Pctl[3],y=xGF60_SH_Pctl[1], label="66%le", color="grey40", hjust=0, size=3) +
+      annotate("segment",x=xGA60_SH_Pctl[2],y=xGF60_SH_Pctl[1],xend=xGA60_SH_Pctl[2], yend=xGF60_SH_Pctl[4], color="grey70") +
+      annotate("text",x=xGA60_SH_Pctl[2],y=xGF60_SH_Pctl[1], label="33%le", color="grey40", hjust=0, size=3) +
+      
+      ## xGF 
+      annotate("segment",y=xGF60_SH_Pctl[3],x=xGA60_SH_Pctl[1],yend=xGF60_SH_Pctl[3], xend=xGA60_SH_Pctl[4], color="grey70") +
+      annotate("text",y=xGF60_SH_Pctl[3],x=xGA60_SH_Pctl[1], label="66%le", color="grey40", vjust=0, size=3) +
+      annotate("segment",y=xGF60_SH_Pctl[2],x=xGA60_SH_Pctl[1],yend=xGF60_SH_Pctl[2], xend=xGA60_SH_Pctl[4], color="grey70") +
+      annotate("text",y=xGF60_SH_Pctl[2],x=xGA60_SH_Pctl[1], label="33%le", color="grey40", vjust=0, size=3) +
+      ## Shorthanded
+      geom_point(data=sh.player.points, aes(x=xGA, y=xGF,group=xG.measure, shape=xG.measure, size=Share.of.Ice, color=season, alpha=season)) +
+      geom_segment(data=sh.player.lines, aes(x=TeamWO_xGA, y=TeamWO_xGF, xend=Player_xGA, yend=Player_xGF, color=season, alpha=season),
+                   arrow = arrow(length=unit(0.30,"cm"), type = "closed")) +
+      scale_size_continuous(limits = c(0,1)) +
+      scale_alpha_discrete(range=c(0.25,1)) +
+      facet_grid(~Player) +
+      labs(title=paste0("SHORTHANDED"), x="Team Expected Goals Against / 60 min", y="Team Expected Goals For / 60 min",
+           color="Season",shape="xG Result",alpha="Season",size="% of Team State\nPlayer On-Ice") +
+      theme(legend.position = "top") +
+      theme(axis.ticks=element_blank(),
+            panel.grid.major=element_blank(),
+            panel.grid.minor=element_blank()) #+ guides( size = FALSE, shape = FALSE,alpha = FALSE ,color = FALSE )    
+
+    return(list(production.plot, ev.results.plot, pp.results.plot, sh.results.plot))
+    
+}
+
+
+
+
+```
+
+The CrowdScout Score is generated at www.crowdscoutsports.com, thanks to fanalysts like you smartly rating players.  
+The Predicted CrowdScout Score is generated by a machine learning algorithm to best guess the score based on stats alone.  
+The input statistics are the result of an expected goals model calculated from publicly available NHL data, code at: www.github.com/C92Anderson/xG-Model
+
+```{r echo=FALSE}
+#library(shiny); library(plotly)
+
+shinyApp(
+  
+  ui <- fluidPage(
+    
+    fluidRow(
+      column(6, h4(textOutput("title"))),
+      column(3, h5("@crowdscoutsprts"))),
+    
+     # column(3, textInput("text", "Text", "")),
+    
+    fluidRow(
+       column(6,
+              checkboxGroupInput("season", "Seasons: ", choices = c("20142015","20152016","20162017"),
+                                                       selected = c("20142015","20152016","20162017"),inline = TRUE)),
+
+       column(6,
+              checkboxGroupInput("states", "Production Game States: ", choices = c("EV", "PP","SH"),
+                                                            selected = c("EV", "PP"),inline = TRUE))
+       ),
+     fluidRow(       
+      column(4,
+             selectInput("p1", "Player 1:", sort(unique(crowdscout_data_predictions$Player)),"P.K. SUBBAN")),
+      column(4,
+             selectInput("p2", "Player 2:", sort(unique(crowdscout_data_predictions$Player)),"ERIK KARLSSON"))
+      ),
+    
+    fluidRow(
+      column(12, plotOutput("prod"))),
+
+    fluidRow(
+      column(12, plotOutput("ev"))),
+
+    fluidRow(
+      column(12, plotOutput("pp"))),
+    
+    fluidRow(
+      column(12, plotOutput("sh")))
+
+  ),
+  
+
+  server <- function(input, output) {
+
+    output$title <- renderText({ paste0(input$p1," & ",input$p2)  })
+    
+    observe({
+      query <- parseQueryString(session$clientData$url_search)
+      if (!is.null(query[['text']])) {
+        updateTextInput(session, "text", value = query[['text']])
+      }
+    })
+    
+    output$prod <- renderPlot({  player.compare.function(input$p1, input$p2, input$season, input$states)[[1]]  })
+    output$ev <- renderPlot({    player.compare.function(input$p1, input$p2, input$season)[[2]]  })
+    output$pp <- renderPlot({    player.compare.function(input$p1, input$p2, input$season)[[3]]  })
+    output$sh <- renderPlot({    player.compare.function(input$p1, input$p2, input$season)[[4]]  })
+    
+  },
+  options = list(height = 1800,
+                 weight = 1600)
+)
+```

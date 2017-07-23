@@ -1,0 +1,259 @@
+---
+title: "Goalie Compare App"
+runtime: shiny
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2);library(dplyr); library(DataCombine)
+library(glmnet); library(nhlscrapr); library(caret); library(RMySQL); library(readr); library(reshape2); library(rvest)
+library(twitteR);library(httr); library(data.table); library("reshape2");
+library(shiny)
+library(ggplot2)
+library(xts)
+library(RMySQL)
+library(DBI)
+theme_set(theme_bw())
+
+options(shiny.deprecation.messages=FALSE)
+
+conn <- dbConnect(
+    drv = RMySQL::MySQL(),
+    dbname = "nhl_all",
+    host = "mysql.crowdscoutsports.com",
+    username = "ca_elo_games",
+    password = "cprice31!")
+
+
+## Get prior player level predictions
+goalie.season.all <- dbGetQuery(conn, "SELECT `SA.Goalie`, season, xGA, GA, SA, `Age.Season.Start`, `xG.xR.Lift.100Shots`, `Surplus.Pts`,`NonRebound.Shots`, `xG.FirstShot`, `xRBA` FROM `nhl_all`.goalie_season_stats")
+goalie.season.betas <- dbGetQuery(conn, "SELECT * FROM `nhl_all`.goalie_season_betas")
+player_elo <- dbGetQuery(conn, "SELECT * FROM `nhl_all`.player_elo")
+
+dbDisconnect(conn)
+
+########################
+### Find percentiles
+########################
+
+xGLift_Pctl <-quantile(goalie.season.all[goalie.season.all$NonRebound.Shots > 200, "xG.xR.Lift.100Shots"], probs = c(0.10,0.33, 0.5, 0.75,0.90))
+#xGxRLift_Pctl <-quantile(goalie.season.all[goalie.season.all$NonRebound.Shots > 200, "xG.xR.Lift.100Shots"], probs = c(0.10,0.33, 0.5, 0.75,0.90))
+Bayesian_Pctl <-quantile(goalie.season.betas$posterior1000_lift, probs = c(0.10,0.33, 0.6, 0.8,0.90))
+
+## Initialize functions
+calcBetaMode <- function(aa, bb) { BetaMode <- (aa - 1)/(aa + bb - 2); return(BetaMode); }
+calcBetaMean <- function(aa, bb) { BetaMean <- (aa)/(aa + bb); return(BetaMean); }
+calcBetaSd   <- function(aa, bb) { BetaSd <- sqrt((aa * bb)/(((aa + bb)^2) * (aa + bb + 1))); return(BetaSd); }
+
+##############################################################################
+##############################################################################
+### Player Compare Function
+##############################################################################
+##############################################################################
+
+goalie.compare.function <- function(p1, p2, seasons = c("20132014","20142015","20152016","20162017"), shot.count.prior = 1000) {
+    
+    p1_elo <- player_elo %>% filter(toupper(Player) == p1) %>% tail(1) %>% select(Score)
+    p2_elo <- player_elo %>% filter(toupper(Player) == p2) %>% tail(1) %>% select(Score)
+ 
+
+    goalie.seasons <- goalie.season.all %>%
+          filter(SA.Goalie %in% c(p1, p2) & season %in% seasons) %>%
+          mutate(Age.Season.Start = as.numeric(Age.Season.Start))
+    
+    rebound.goal.probability <- 0.2560365
+    
+    goalie.seasons <- goalie.seasons %>%
+          group_by(SA.Goalie) %>%
+          summarise(xG.xR.Lift.100Shots = ((sum(xG.FirstShot) + sum(xRBA * rebound.goal.probability)) - sum(GA)) / (sum(NonRebound.Shots) / 100),
+                Surplus.Pts = (sum(xGA) - sum(GA)) / (1 / 0.3603384),
+                Age.Season.Start = mean(as.numeric(Age.Season.Start), w=NonRebound.Shots),
+                NonRebound.Shots = sum(NonRebound.Shots)) %>%
+          mutate(season = "TOTAL") %>%
+        dplyr::bind_rows(goalie.seasons)
+
+    goalie.seasons$SA.Goalie <- factor(goalie.seasons$SA.Goalie, levels = c(p1, p2))
+    
+    goalie.plot <- goalie.seasons %>%
+      ggplot(aes(x=season, y=xG.xR.Lift.100Shots, size=NonRebound.Shots, color=Surplus.Pts)) +
+      geom_hline(yintercept = as.numeric(xGLift_Pctl[1]), color = "coral1", linetype = "dashed", show.legend = T) +
+      geom_text(aes(x=min(season),y=as.numeric(xGLift_Pctl[1]), label="Top 60 - 10th %le "), hjust=0, vjust = -1, color="coral1", size=2.5) +
+    
+      geom_hline(yintercept = as.numeric(xGLift_Pctl[2]), color = "coral4", linetype = "dashed", show.legend = T) +
+      geom_text(aes(x=min(season),y=as.numeric(xGLift_Pctl[2]), label="Top 45 - 33th %le"), hjust=0, vjust = -1, color="coral4", size=2.5) +
+
+      geom_hline(yintercept = as.numeric(xGLift_Pctl[3]), color = "grey50", linetype = "dashed", show.legend = T) +
+      geom_text(aes(x=min(season),y=as.numeric(xGLift_Pctl[3]), label="Top 30 - 50th %le"), hjust=0, vjust = -1, color="grey50", size=2.5) +
+      
+      geom_hline(yintercept = as.numeric(xGLift_Pctl[4]), color = "darkorchid4", linetype = "dashed", show.legend = T) +
+      geom_text(aes(x=min(season),y=as.numeric(xGLift_Pctl[4]), label="Top 15 - 75th %le"), hjust=0, vjust = -1, color="darkorchid4", size=2.5) +
+      
+      geom_hline(yintercept = as.numeric(xGLift_Pctl[5]), color = "darkorchid1", linetype = "dashed", show.legend = T) +
+      geom_text(aes(x=min(season),y=as.numeric(xGLift_Pctl[5]), label="Top 5 - 90th %le"), hjust=0, vjust = -1, color="darkorchid1", size=2.5) +
+
+      geom_segment(aes(x = season, xend=season, y = 0, yend = xG.xR.Lift.100Shots, color = Surplus.Pts),size=2) +
+      
+      geom_label(aes(x=season, y=as.numeric(xGLift_Pctl[1]) - 0.1, label=paste0(Age.Season.Start,"yo")),size=2.5, color="grey50") +
+      
+      geom_point() +
+
+      facet_wrap(~SA.Goalie) + 
+      scale_color_gradient2(low="coral1",mid="grey50",high="darkorchid1", midpoint = 0) +
+
+    scale_size_continuous(range=c(2.5,10)) +
+    labs(title=paste0(p1," CROWDSCOUT SCORE: ",round(p1_elo,1), "\n"
+                      ,p2," CROWDSCOUT SCORE: ",round(p2_elo,1),"\nGOALS PREVENTED OVER EXPECTED PER 100 SHOTS\nDashed Lines represents 90th, 75th, 50th, 33rd, 10th Percentile Seasonal xGA - GA / 100 Shots Performance (Minimum 200 Shots)"), x="Season", 
+         y="Expected Goals & Expected Rebound Goals - Actual Goals\nper 100 Shots", color="Surplus Points to Team\nOver Seasonal Average Goaltending",
+         size="Non-Rebound Shots Against") +
+    theme(legend.position = "bottom") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+    
+ ##### Bayesian    
+    goalie.betas <- goalie.season.betas %>%
+          filter(SA.Goalie %in% c(p1, p2) & season %in% seasons) %>%
+          rowwise() %>%
+          mutate(beta_a = (1 - ( (xG.FirstShot + xG.RB) / NonRebound.Shots)) * shot.count.prior,
+                 beta_b = shot.count.prior - beta_a,
+                 
+                posterior_a = beta_a + (likelihood_a - 1),  ## Success + Beta A
+                posterior_b = beta_b +  (likelihood_b - 1) , ## Goals + Beta B
+                
+                prior_mean      = calcBetaMean(beta_a, beta_b),
+                likelihood_mean = calcBetaMean(likelihood_a, likelihood_b),
+                posterior_mean  = calcBetaMean(posterior_a, posterior_b),
+                prior_sd        = calcBetaSd(beta_a, beta_b),
+                likelihood_sd   = calcBetaSd(likelihood_a, likelihood_b),
+                posterior_sd    = calcBetaSd(posterior_a, posterior_b),
+                
+                posterior_lift = posterior_mean - prior_mean,
+                lift_std = sqrt(((posterior_sd ** 2))  +  ((prior_sd ** 2))))
+
+    
+    #SPAR_Pctl <-quantile(goalie.season.all$Surplus.Pts.AboveReplacement, probs = c(0.10,0.33, 0.5, 0.66,0.90))
+
+    goalie.betas <- goalie.betas %>%
+          group_by(SA.Goalie) %>%
+          summarise(xG.FirstShot = sum(xG.FirstShot),
+                    xG.RB = sum(xG.RB),
+                    NonRebound.Shots = sum(NonRebound.Shots),
+                    likelihood_a = sum(likelihood_a),
+                    likelihood_b = sum(likelihood_b)) %>%
+          rowwise() %>%
+          mutate(beta_a = (1 - ( (xG.FirstShot + xG.RB) / NonRebound.Shots)) * shot.count.prior,
+                 beta_b = shot.count.prior - beta_a,
+                 
+                posterior_a = beta_a + (likelihood_a - 1),  ## Success + Beta A
+                posterior_b = beta_b +  (likelihood_b - 1) , ## Goals + Beta B
+                
+                prior_mean      = calcBetaMean(beta_a, beta_b),
+                likelihood_mean = calcBetaMean(likelihood_a, likelihood_b),
+                posterior_mean  = calcBetaMean(posterior_a, posterior_b),
+                prior_sd        = calcBetaSd(beta_a, beta_b),
+                likelihood_sd   = calcBetaSd(likelihood_a, likelihood_b),
+                posterior_sd    = calcBetaSd(posterior_a, posterior_b),
+                
+                posterior_lift = posterior_mean - prior_mean,
+                lift_std = sqrt(((posterior_sd ** 2))  +  ((prior_sd ** 2)))) %>%
+        mutate(season = "TOTAL") %>%
+        dplyr::bind_rows(goalie.betas)
+
+                
+    goalie.betas$SA.Goalie <- factor(goalie.betas$SA.Goalie, levels = c(p1, p2))
+   
+    goalie.priors <- goalie.betas %>%
+      ggplot() +
+
+      geom_segment(aes(x = season, xend=season, y = prior_mean, yend = likelihood_mean, color = (likelihood_mean - prior_mean)),size=2) +
+      
+      geom_point(aes(x= season, y = prior_mean, alpha = prior_sd),color="red", size=8) +
+      geom_label(aes(x= season, y = prior_mean),color="red", size=2.5, label="Expected Sv%") +
+
+      geom_point(aes(x= season, y = likelihood_mean, alpha = likelihood_sd),color="green4",size=8) +
+      geom_label(aes(x= season, y = likelihood_mean),color="green4", size=2.5, label="Realized Sv%") +
+
+      geom_point(aes(x= season, y = posterior_mean, alpha = posterior_sd),color="blue",size=10) +
+      geom_label(aes(x= season, y = posterior_mean),color="blue", size=3, label="Posterior Sv%") +
+
+      facet_wrap(~SA.Goalie) + 
+      scale_color_gradient2(low="coral1",mid="grey50",high="darkorchid1", midpoint = 0, labels = scales::percent) +
+      scale_alpha_continuous(range=c(0.5,1)) +
+      scale_y_continuous(labels = scales::percent) +
+
+      labs(title=paste0("Goaltender Bayesian Performance\nPosterior Save% Approaches Realized Sv% Based on Evidence (Shots Against) using a ",shot.count.prior, " Shot Prior"), x="Season", 
+         y="Expected / Realized / Posterior Save Percentage\n(Non-Rebound Shots)", color="Actual - Expected Save %\n(Non-Rebound Shots)",alpha="Metric Standard Deviation") +
+    theme(legend.position = "bottom") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+   
+    return(list(goalie.plot, goalie.priors))
+    
+}
+
+
+
+
+```
+
+The CrowdScout Score is generated at www.crowdscoutsports.com, thanks to fanalysts like you smartly rating players.  
+The Predicted CrowdScout Score is generated by a machine learning algorithm to best guess the score based on stats alone.  
+The input statistics are the result of an expected goals model calculated from publicly available NHL data, code at: www.github.com/C92Anderson/xG-Model
+
+```{r echo=FALSE}
+#library(shiny); library(plotly)
+
+shinyApp(
+  
+  ui <- fluidPage(
+    
+    fluidRow(
+      column(6, h4(textOutput("title"))),
+      column(3, h5("@crowdscoutsprts"))),
+    
+     # column(3, textInput("text", "Text", "")),
+    
+    fluidRow(
+       column(6,
+              checkboxGroupInput("season", "Seasons: ", choices = c("20082009","20092010","20102011","20112012",
+                                        "20122013","20132014","20142015","20152016","20162017"),
+                                                       selected = c("20132014","20142015","20152016","20162017"),inline = TRUE )),
+       column(6,
+              sliderInput("shot.count.prior", "Shots Against Prior: ", min = 0, max = 2500, step = 250, value = 1000))
+       ),
+
+     fluidRow(       
+      column(4,
+             selectInput("p1", "Player 1:", sort(unique(goalie.season.all$SA.Goalie)),"CAREY PRICE")),
+      column(4,
+             selectInput("p2", "Player 2:", sort(unique(goalie.season.all$SA.Goalie)),"TUUKKA RASK"))
+      ),
+    
+    fluidRow(
+      column(12, plotOutput("xG"))),
+
+    fluidRow(
+      column(12, plotOutput("bayes")))
+
+  ),
+  
+
+  server <- function(input, output) {
+
+    output$title <- renderText({ paste0(input$p1," & ",input$p2)  })
+    
+#    observe({
+#      query <- parseQueryString(session$clientData$url_search)
+#      if (!is.null(query[['text']])) {
+#        updateTextInput(session, "text", value = query[['text']])
+#      }
+#    })
+    
+    output$xG <- renderPlot({  goalie.compare.function(input$p1, input$p2, input$season, input$shot.count.prior)[[1]]  })
+    output$bayes <- renderPlot({    goalie.compare.function(input$p1, input$p2, input$season, input$shot.count.prior)[[2]]  })
+
+  },
+  options = list(height = 1800,
+                 weight = 1600)
+)
+```
